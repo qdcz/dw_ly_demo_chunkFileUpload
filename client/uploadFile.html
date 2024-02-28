@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>分片文件上传示例</title>
+</head>
+
+<body>
+
+
+    <div>当前进度：<span id="progressInfo"></span></div>
+    <input type="file" id="uploadFile">
+    <script>
+        const uploadFileDom = document.querySelector("#uploadFile");
+        const chunkSize = 1024 * 1024 * 50 // 50M
+        const THREAD_COUNT = navigator.hardwareConcurrency || 4;
+
+        const progressInfo = {
+            total: 0,
+            uploaded: 0,
+            fileSize: 0
+        }
+
+        uploadFileDom.addEventListener("change", async (e) => {
+            try {
+                await checkFileExist(e.target.files[0].name);
+                console.time("解析文件耗时");
+                const chunks = e.target.files[0];
+                const data = await cutFile(chunks);
+                console.log("data", data);
+                console.timeEnd("解析文件耗时");
+            } catch (e) {
+                console.warn("文件已经存在是否覆盖上传！")
+            }
+        })
+
+
+
+        const cutFile = async function (file) {
+            return new Promise((resolve) => {
+                // 将文件分成多少切片
+                const chunkCount = Math.ceil(file.size / chunkSize);
+                // 每个线程分多少切片处理
+                const threadChunkCount = Math.ceil(chunkCount / THREAD_COUNT);
+                // 需要提交的表单数据
+                const result = [];
+                let finishCount = 0;
+
+                // 开启线程数边界 --think
+                let startWorkCount = THREAD_COUNT < chunkCount ? THREAD_COUNT : chunkCount;
+
+                console.table({chunkSize, THREAD_COUNT, chunkCount, threadChunkCount})
+                // 根据线程数来开启worker
+                for (let THREAD_index = 0; THREAD_index < startWorkCount; THREAD_index++) {
+                    const worker = new Worker("utils/work.js");
+
+                    // threadChunkCount * THREAD_COUNT - chunkCount
+
+                    const start = THREAD_index * threadChunkCount;
+                    let end = (THREAD_index + 1) * threadChunkCount;
+
+                    // 边界处理 由于用了 Math.ceil  所以后面几个会出现重复 直接过滤
+                    if (end > chunkCount) {
+                        end = chunkCount
+                    }
+
+                    worker.postMessage({
+                        file,
+                        chunkSize,
+                        startChunkIndex: start,
+                        endChunkIndex: end
+                    });
+
+                    worker.onmessage = (e) => {
+                        // console.log('来自单个线程的返回的数据', e.data);
+                        // 返回的数据是无序的，需要重新整理。
+                        e.data.forEach(element => result[element.index] = element);
+                        worker.terminate();
+                        finishCount++;
+                        if (finishCount == startWorkCount) {
+                            result.forEach(item => {
+                                uploadChunks(item, file.name, file.size); // Upload chunks to server
+                            })
+                            resolve(result)
+                        }
+                    }
+                }
+            })
+        }
+
+        // 上传分片文件   上传完分片完之后需要提交一个验证的成功的接口。
+        const uploadChunks = function (chunk, filename, fileSize) {
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                const url = 'http://localhost:3000/upload';
+
+                xhr.open('POST', url);
+                xhr.onload = async function () {
+                    if (xhr.status === 200) {
+                        const data = JSON.parse(xhr.response);
+                        // TODO 后期加上hash 再次对称加密验证文件唯一性
+                        if (data.hash == chunk.hash) {
+                            // 将文件信息返回出去
+                            await verifyChunkFileFull({
+                                filename, fileSize, index: chunk.index, hash: chunk.hash
+                            })
+                        }
+                        console.log("返回的数据：", data)
+                        resolve(xhr.responseText);
+                    } else {
+                        reject('Upload failed. Status: ' + xhr.status);
+                    }
+                };
+                xhr.onerror = function () {
+                    reject('Upload failed. Network error.');
+                };
+                xhr.addEventListener("progress", function (e) {
+                    if (e.lengthComputable) {
+                        // const percentComplete = (e.loaded / e.total) * 100;
+                        // console.log('上传进度：', percentComplete + '%');
+                        progressInfo.total = Math.ceil(fileSize / chunkSize);
+                        progressInfo.uploaded++;
+                        progressInfo.fileSize = (progressInfo / 1024 / 1024).toFixed(2)
+                        document.querySelector("#progressInfo").innerHTML = `
+                            uploaded:${progressInfo.uploaded} / total:${progressInfo.total}
+                            fileSize:${progressInfo.fileSize} M
+                        `;
+
+                        if (chunk.index + 1 == progressInfo.total) {
+                            // 清空选中状态
+                            uploadFile.value = '';
+                            // 最后一个清除input选项
+                            progressInfo.total = 0;
+                            progressInfo.uploaded = 0;
+                            progressInfo.fileSize = 0;
+                            document.querySelector("#progressInfo").innerHTML = ``;
+                        }
+                    }
+                });
+
+                /**
+                 * 发送表单数据
+                 **/
+                const formData = new FormData();
+                formData.append('filename', filename);
+                formData.append('fileSize', fileSize);
+                formData.append('chunk', chunk.blob);
+                formData.append('index', chunk.index);
+                formData.append('hash', chunk.hash);
+                xhr.send(formData);
+            });
+        };
+
+        const verifyChunkFileFull = function (fileInfo) {
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                const url = 'http://localhost:3000/verificationFileFull';
+                xhr.open('POST', url);
+                xhr.setRequestHeader("Content-type", "application/json");
+                xhr.onload = function () {
+                    if (xhr.status === 200) {
+                        const data = JSON.parse(xhr.response);
+                        console.log("返回的数据：", data)
+                        resolve(xhr.responseText);
+                    } else {
+                        reject('Upload failed. Status: ' + xhr.status);
+                    }
+                };
+                xhr.onerror = function () {
+                    reject('verificationFileFull failed. Network error.');
+                };
+                xhr.send(JSON.stringify(fileInfo));
+            });
+        }
+
+        const checkFileExist = function (filename) {
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                const url = 'http://localhost:3000/checkFileExist';
+                xhr.open('POST', url);
+                xhr.setRequestHeader("Content-type", "application/json");
+                xhr.onload = function () {
+                    if (xhr.status === 200) {
+                        resolve(xhr.responseText);
+                    } else {
+                        reject('Upload failed. Status: ' + xhr.status);
+                    }
+                };
+                xhr.onerror = function () {
+                    reject('verificationFileFull failed. Network error.');
+                };
+                xhr.send(JSON.stringify({
+                    filename
+                }));
+            });
+        }
+    </script>
+</body>
+
+</html>
